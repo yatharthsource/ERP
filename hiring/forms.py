@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 from django import forms
 from django.contrib.auth import get_user_model
@@ -9,13 +9,13 @@ from people.models import Person, phone_key
 from people.services import visible_people
 from people.widgets import PhoneWidget
 
+from . import whereabouts
 from .models import (
     CallLog,
     FollowUp,
-    HRAssessment,
-    Interview,
     Requisition,
     RequisitionPost,
+    day_start,
 )
 
 LANGUAGES = [
@@ -167,19 +167,18 @@ class ImportForm(forms.Form):
         self.fields["requisition"].queryset = requisitions
 
 
+class DayField(forms.DateField):
+    """A date, kept as the start of that day: follow-ups have no time."""
+
+    widget = forms.DateInput(attrs={"type": "date"}, format="%Y-%m-%d")
+
+    def clean(self, value):
+        day = super().clean(value)
+        return day_start(day) if day else day
+
+
 def _when(label, **kw):
-    return forms.DateTimeField(
-        label=label,
-        widget=forms.DateTimeInput(
-            attrs={"type": "datetime-local"}, format="%Y-%m-%dT%H:%M"
-        ),
-        **kw,
-    )
-
-
-def tomorrow_morning():
-    day = timezone.localtime() + timedelta(days=1)
-    return day.replace(hour=10, minute=0, second=0, microsecond=0)
+    return DayField(label=label, **kw)
 
 
 class CallForm(forms.Form):
@@ -212,19 +211,31 @@ class CallForm(forms.Form):
     )
     department_changed = forms.BooleanField(required=False)
     discuss = forms.BooleanField(required=False)
+    mini_on = forms.BooleanField(required=False)
+    major_on = forms.BooleanField(required=False)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        data = self.data if self.is_bound else None
+        self.mini = whereabouts.WhereaboutForm(whereabouts.MINI, data, prefix="mini")
+        self.major = whereabouts.WhereaboutForm(
+            whereabouts.COMMON, data, prefix="major", department=True
+        )
+        self.groups = {
+            key: whereabouts.WhereaboutForm(keys, data, prefix=key)
+            for key, (_, keys) in whereabouts.GROUPS.items()
+        }
+        for key, (label, _) in whereabouts.GROUPS.items():
+            self.groups[key].title = label
         # Pre-filled so the usual "try again tomorrow" is one tap.
-        self.fields["next_due"].initial = tomorrow_morning().date()
+        self.fields["next_due"].initial = timezone.localdate() + timedelta(days=1)
         self.fields["next_due"].widget.attrs["min"] = timezone.localdate().isoformat()
 
     def clean_next_due(self):
         day = self.cleaned_data["next_due"]
         if day < timezone.localdate():
             raise forms.ValidationError("The next follow-up can't be before today.")
-        # Only the day is asked for; the call alarm rings at the usual 10:00.
-        return timezone.make_aware(datetime.combine(day, tomorrow_morning().time()))
+        return day_start(day)
 
     def clean(self):
         data = super().clean()
@@ -243,6 +254,18 @@ class CallForm(forms.Form):
             )
             if on and not data.get(text, "").strip():
                 self.add_error(text, message)
+        data["mini_whereabout"] = data["major_whereabout"] = {}
+        if data.get("mini_on"):
+            if self.mini.is_valid():
+                data["mini_whereabout"] = self.mini.answers()
+            else:
+                self.add_error(None, "Check the mini whereabout.")
+        if data.get("major_on"):
+            group = self.groups.get(self.major.data.get("major-department"))
+            if self.major.is_valid() and group.is_valid():
+                data["major_whereabout"] = {**self.major.answers(), **group.answers()}
+            else:
+                self.add_error(None, "Check the major whereabout.")
         return data
 
 
@@ -262,7 +285,7 @@ class IncomingCallForm(CallForm):
 
 
 class RescheduleForm(forms.Form):
-    due = _when("New date and time")
+    due = _when("New date")
     reason = forms.ChoiceField(choices=FollowUp.Reason.choices)
 
 
@@ -271,11 +294,13 @@ class ScheduleCallForm(forms.Form):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.fields["due"].initial = tomorrow_morning()
+        self.fields["due"].initial = timezone.localdate() + timedelta(days=1)
 
 
 class ShiftForm(forms.Form):
-    group = forms.ChoiceField(choices=[(g, g) for g in ("overdue", "today", "later")])
+    group = forms.ChoiceField(
+        choices=[(g, g) for g in ("all", "overdue", "today", "later")]
+    )
     day = forms.DateField(
         label="Move to",
         widget=forms.DateInput(attrs={"type": "date"}, format="%Y-%m-%d"),
@@ -319,24 +344,6 @@ class BulkForm(ReassignForm):
         return data
 
 
-class InterviewForm(forms.Form):
-    result = forms.ChoiceField(
-        choices=Interview.Result.choices, widget=forms.RadioSelect
-    )
-    next_due = _when("Call again on", required=False)
-    questions = forms.CharField(
-        required=False, widget=forms.Textarea(attrs={"rows": 3})
-    )
-    notes = forms.CharField(required=False, widget=forms.Textarea(attrs={"rows": 3}))
-
-
-class AssessmentForm(forms.ModelForm):
-    class Meta:
-        model = HRAssessment
-        fields = ["decision", "level", "hold_tenure", "comments"]
-        widgets = {"comments": forms.Textarea(attrs={"rows": 3})}
-
-
 class StartOfferForm(forms.Form):
     amount = forms.DecimalField(
         label="Monthly offer", max_digits=10, decimal_places=2, min_value=1
@@ -373,6 +380,33 @@ class JoinedForm(forms.Form):
         label="Joined on",
         initial=timezone.localdate,
         widget=forms.DateInput(attrs={"type": "date"}, format="%Y-%m-%d"),
+    )
+
+    def __init__(self, *args, floor=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.floor = floor  # the day they accepted the offer
+
+    def clean_joined_on(self):
+        day = self.cleaned_data["joined_on"]
+        if self.floor and day < self.floor:
+            raise forms.ValidationError(
+                f"They accepted on {self.floor:%d %b %Y}; join on or after it."
+            )
+        return day
+
+    resources = forms.CharField(
+        label="Resources allotted",
+        required=False,
+        max_length=500,
+        widget=forms.Textarea(attrs={"rows": 2}),
+    )
+    sim_allotted = forms.ChoiceField(
+        label="SIM allotted",
+        choices=[("Yes", "Yes"), ("No", "No")],
+        widget=forms.RadioSelect,
+    )
+    notes = forms.CharField(
+        required=False, max_length=1000, widget=forms.Textarea(attrs={"rows": 2})
     )
 
 

@@ -1,5 +1,8 @@
+from django.utils import timezone
+
 from core.export import stamp, workbook_response
 
+from . import interview_form, whereabouts
 from .models import CallLog, OfferRound, RequisitionPost
 from .services import by_source
 
@@ -149,11 +152,11 @@ def followups_workbook(followups):
                         f.person.name,
                         f.person.phone,
                         f.get_purpose_display(),
-                        f.due,
+                        timezone.localtime(f.due).date(),
                         f.owner.get_full_name() or f.owner.get_username(),
                         str(f.requisition) if f.requisition else "",
                         f.reschedule_count,
-                        f.original_due,
+                        f.original_due and timezone.localtime(f.original_due).date(),
                     )
                     for f in followups
                 ],
@@ -170,6 +173,8 @@ def followups_workbook(followups):
                     "Reschedule reason",
                     "Department change",
                     "Discuss with manager",
+                    "Mini whereabout",
+                    "Major whereabout",
                 ),
                 [
                     (
@@ -183,6 +188,8 @@ def followups_workbook(followups):
                         c.reschedule_reason,
                         c.department_changed,
                         c.discussed,
+                        whereabouts.summary(c.mini_whereabout),
+                        whereabouts.summary(c.major_whereabout),
                     )
                     for c in CallLog.objects.filter(person_id__in=people)
                     .exclude(not_a_call=True)
@@ -208,6 +215,8 @@ def interviews_workbook(interviews, include_hr=False):
                 "Interviewer",
                 "Questions asked",
                 "Notes",
+                "Profile",
+                "Form answers",
             ),
             [
                 (
@@ -219,6 +228,8 @@ def interviews_workbook(interviews, include_hr=False):
                     who(i.interviewer),
                     i.questions,
                     i.notes,
+                    i.profile,
+                    interview_form.summary(i.answers),
                 )
                 for i in interviews
             ],
@@ -226,7 +237,15 @@ def interviews_workbook(interviews, include_hr=False):
     }
     if include_hr:
         sheets["HR assessments"] = (
-            ("Candidate", "Decision", "Level", "Hold tenure", "Comments", "Assessor"),
+            (
+                "Candidate",
+                "Decision",
+                "Level",
+                "Hold tenure",
+                "Comments",
+                "Assessor",
+                "PFA answers",
+            ),
             [
                 (
                     i.person.name,
@@ -235,6 +254,7 @@ def interviews_workbook(interviews, include_hr=False):
                     i.hr.hold_tenure,
                     i.hr.comments,
                     who(i.hr.assessor),
+                    interview_form.summary(i.hr.answers),
                 )
                 for i in interviews
                 if hasattr(i, "hr")
@@ -305,6 +325,9 @@ def onboarding_workbook(expecting, joined):
             o.joining_date,
             o.joined_on,
             float(o.latest.amount),
+            o.resources,
+            o.sim_allotted,
+            o.onboarding_notes,
         )
 
     return workbook_response(
@@ -318,6 +341,9 @@ def onboarding_workbook(expecting, joined):
                     "Joining date",
                     "Joined on",
                     "Agreed offer",
+                    "Resources allotted",
+                    "SIM allotted",
+                    "Notes",
                 ),
                 [row(o) for o in [*expecting, *joined]],
             )

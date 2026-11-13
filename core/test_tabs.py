@@ -76,11 +76,12 @@ def test_calling_only_user_cannot_open_screening_or_sourcing(client, worker, sen
     assert client.get(reverse("hiring:call_new")).status_code != 403
 
 
-def test_hr_assessment_needs_its_own_tab(client, worker, senken):
+def test_interview_review_needs_selecting_or_hiring(client, worker, senken):
+    assert client.get(reverse("hiring:interview_review", args=[1])).status_code == 403
+    give(worker, senken, "calling")
+    assert client.get(reverse("hiring:interview_review", args=[1])).status_code == 403
     give(worker, senken, "selecting")
-    assert client.get(reverse("hiring:assess", args=[1])).status_code == 403
-    give(worker, senken, "assessments")
-    assert client.get(reverse("hiring:assess", args=[1])).status_code == 404
+    assert client.get(reverse("hiring:interview_review", args=[1])).status_code == 404
 
 
 def test_export_follows_its_tab(client, worker, senken):

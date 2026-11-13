@@ -1,6 +1,7 @@
 from datetime import datetime, time, timedelta
 from types import SimpleNamespace
 
+from django.contrib.auth import get_user_model
 from django.db import transaction
 from django.db.models import (
     Case,
@@ -16,12 +17,14 @@ from django.db.models import (
 from django.db.models.functions import Coalesce
 from django.urls import reverse
 from django.utils import timezone
+from django.utils.dateparse import parse_time
 from simple_history.utils import bulk_update_with_history
 
 from notifications.services import notify
 from people.models import Person, phone_key
 from tasks.services import can_assign
 
+from . import interview_form, whereabouts
 from .models import (
     CallLog,
     FollowUp,
@@ -31,6 +34,7 @@ from .models import (
     OfferRound,
     Requisition,
     SourcedNumber,
+    day_start,
 )
 
 
@@ -146,11 +150,21 @@ def requisition_timeline(r):
     return sorted(events, key=lambda e: e[0], reverse=True)
 
 
+def today():
+    return day_start(timezone.localdate())
+
+
+def next_day():
+    """Tomorrow: when a sourced candidate is first called."""
+    return day_start(timezone.localdate() + timedelta(days=1))
+
+
 def source_number(
     requisition, name, phone, user, source="", email="", address="", gender=""
 ):
     """Log a number received for a requisition. A new number makes a card; a
-    number already on a card (last 10 digits, same company) links to it instead."""
+    number already on a card (last 10 digits, same company) links to the card used
+    last instead."""
     if len(phone_key(phone)) < 10:
         raise ValueError("Enter a phone number with at least 10 digits.")
     with transaction.atomic():
@@ -158,7 +172,7 @@ def source_number(
             Person.objects.filter(
                 company=requisition.company, phone_key=phone_key(phone)
             )
-            .order_by("pk")
+            .order_by("-pk")  # the card used last time
             .first()
         )
         duplicate = person is not None
@@ -171,10 +185,20 @@ def source_number(
                 address=address,
                 gender=gender,
             )
-        if not duplicate:
-            # A new card goes straight into the sourcer's call queue.
+        # Every sourced number, new or repeat, is called tomorrow as a normal
+        # follow-up, unless the candidate already has a call waiting (an interview
+        # or an offer is never pushed around by a repeat). Any card with this
+        # number counts, not only the one chosen above.
+        if not FollowUp.objects.filter(
+            status=FollowUp.Status.PENDING,
+            person__company=requisition.company,
+            person__phone_key=phone_key(phone),
+        ).exists():
             FollowUp.objects.create(
-                person=person, requisition=requisition, due=timezone.now(), owner=user
+                person=person,
+                requisition=requisition,
+                due=next_day(),
+                owner=user,
             )
         return SourcedNumber.objects.create(
             requisition=requisition,
@@ -254,14 +278,18 @@ def log_call(
     reschedule_reason="",
     department_changed=False,
     discuss=False,
+    mini_whereabout=None,
+    major_whereabout=None,
     person=None,
 ):
     """Record a call: complete the follow-up and open the next one for `intention`.
     With no follow-up (a call that came in) it is logged for `person` alone.
-    A department change or a discuss request sends the card to the caller's
-    supervisor."""
-    boss = user.supervisor if (discuss or department_changed) else None
-    if (discuss or department_changed) and not boss:
+    A department change, a discuss request or a whereabout form sends the card
+    to the caller's supervisor."""
+    mini_whereabout, major_whereabout = mini_whereabout or {}, major_whereabout or {}
+    send = discuss or department_changed or mini_whereabout or major_whereabout
+    boss = user.supervisor if send else None
+    if send and not boss:
         raise FollowUpError("You have no supervisor set to send this to.")
     with transaction.atomic():
         current = _pending(followup) if followup else None
@@ -277,6 +305,8 @@ def log_call(
             reschedule_reason=reschedule_reason,
             department_changed=department_changed,
             discussed=discuss,
+            mini_whereabout=mini_whereabout,
+            major_whereabout=major_whereabout,
         )
         if current:
             current.status = FollowUp.Status.COMPLETED
@@ -298,7 +328,13 @@ def log_call(
             )
             _open(after, intention, next_due, intention_other)
         if boss:
-            why = "a department change" if department_changed else "a discussion"
+            why = (
+                "a department change"
+                if department_changed
+                else "a discussion"
+                if discuss
+                else "a look at a whereabout form"
+            )
             notify(
                 boss,
                 f"{user.display_name} needs {why} with you: {person.name}",
@@ -355,15 +391,14 @@ def bulk_reassign(followups, owner, by):
 
 
 def bulk_move(followups, day, reason):
-    """Move many pending follow-ups to `day`, each keeping its time of day and
-    its first date, and counting the move."""
+    """Move many pending follow-ups to `day`, keeping each one's first date and
+    counting the move. One bulk write, not one save per follow-up."""
     with transaction.atomic():
         rows = list(followups.select_related(None).select_for_update())
         for f in rows:
-            at = timezone.localtime(f.due).time()
             f.original_due = f.original_due or f.due
             f.snoozed_until = None
-            f.due = timezone.make_aware(datetime.combine(day, at))
+            f.due = day_start(day)
             f.reschedule_reason = reason
             f.reschedule_count += 1
             f.version += 1
@@ -403,7 +438,16 @@ def interviews_waiting(user, companies):
     return visible_followups(user, companies).filter(purpose=FollowUp.Purpose.INTERVIEW)
 
 
-def record_interview(followup, result, user, questions="", notes="", next_due=None):
+def record_interview(
+    followup,
+    result,
+    user,
+    questions="",
+    notes="",
+    next_due=None,
+    profile="",
+    answers=None,
+):
     """Record how an interview went. It completes the booking, and what happens
     next follows the result: selected opens an offer, hold opens a call if a date
     is given, rejected ends it."""
@@ -417,13 +461,22 @@ def record_interview(followup, result, user, questions="", notes="", next_due=No
             result=result,
             questions=questions,
             notes=notes,
+            profile=profile,
+            answers=answers or {},
             interviewer=user,
         )
+        apply_to_person(interview)
+        for boss in get_user_model().objects.filter(is_superuser=True, is_active=True):
+            notify(
+                boss,
+                f"Interview form filed: {current.person.name}",
+                reverse("hiring:interview_review", args=[interview.pk]),
+            )
         current.status = FollowUp.Status.COMPLETED
         current.version += 1
         current.save(update_fields=["status", "version"])
         nxt = {
-            Interview.Result.SELECTED: (FollowUp.Purpose.OFFER, timezone.now()),
+            Interview.Result.SELECTED: (FollowUp.Purpose.OFFER, today()),
             Interview.Result.HOLD: (FollowUp.Purpose.CALL, next_due),
         }.get(result)
         if nxt and nxt[1]:
@@ -433,21 +486,99 @@ def record_interview(followup, result, user, questions="", notes="", next_due=No
 
 def visible_interviews(companies):
     return Interview.objects.filter(person__company__in=companies).select_related(
-        "person", "requisition", "hr"
+        "person", "requisition", "hr", "interviewer"
     )
 
 
-def save_assessment(interview, decision, level, user, hold_tenure="", comments=""):
-    return HRAssessment.objects.update_or_create(
-        interview=interview,
-        defaults=dict(
-            decision=decision,
-            level=level,
-            hold_tenure=hold_tenure,
-            comments=comments,
-            assessor=user,
-        ),
-    )[0]
+def apply_to_person(interview, preference=None):
+    """Write what the interview form learned onto the candidate's card. The form
+    filled last wins. Name and phone are never changed from here."""
+    a = interview.answers
+    changes = {
+        "email": a.get("email"),
+        "address": a.get("temporary_address"),
+        "permanent_address": a.get("permanent_address"),
+        "highest_education": a.get("highest_education"),
+        "expected_salary": a.get("expected_salary"),
+        "joining_period": a.get("joining_days") and f"{a['joining_days']} days",
+        "place_of_birth": a.get("place_of_birth"),
+        "alternate_phone": a.get("alternate_phone"),
+        "date_of_birth": whereabouts.parse_day(a.get("date_of_birth")),
+        "time_of_birth": parse_time(a.get("time_of_birth") or ""),
+        "priority": preference,
+    }
+    if a.get("experience_months") is not None:
+        changes["experience_years"] = round(a["experience_months"] / 12, 1)
+    changes = {k: v for k, v in changes.items() if v not in (None, "")}
+    if not changes:
+        return
+    person = Person.objects.select_for_update().get(pk=interview.person_id)
+    for k, v in changes.items():
+        setattr(person, k, v)
+    person.version += 1
+    person.save()
+
+
+def _follow_up_after_assessment(interview, decision, answers):
+    """An offer named in the HR form turns the candidate's pending call into an
+    offer call, and the next follow up date, if given, becomes its date."""
+    person = interview.person
+    day = whereabouts.parse_day(answers.get("next_follow_up"))
+    due = day_start(day) if day else None
+    offered = interview_form.offer_amount(answers.get("offer_given")) > 0
+    # Interview and joining reminders are other people's work; leave them be.
+    pending = (
+        person.followups.filter(status=FollowUp.Status.PENDING)
+        .exclude(purpose__in=[FollowUp.Purpose.INTERVIEW, FollowUp.Purpose.JOINING])
+        .order_by("-created_at", "-id")
+    )
+    current = pending.first()
+    if not (offered or due):
+        return
+    if current is None:
+        if offered or decision == Interview.Result.HOLD:
+            FollowUp.objects.create(
+                person=person,
+                requisition=interview.requisition,
+                purpose=FollowUp.Purpose.OFFER if offered else FollowUp.Purpose.CALL,
+                due=due or today(),
+                owner=interview.followup.owner
+                if interview.followup_id
+                else interview.interviewer,
+            )
+        return
+    if offered:
+        current.purpose, current.purpose_other = FollowUp.Purpose.OFFER, ""
+    if due:
+        current.original_due = current.original_due or current.due
+        current.due, current.snoozed_until = due, None
+    current.version += 1
+    current.save()
+
+
+def save_assessment(
+    interview, decision, level, user, hold_tenure="", comments="", answers=None
+):
+    """HR's side. The decision becomes the interview's result: selected opens the
+    offer, hold opens a call on the follow-up date if one is given."""
+    answers = answers or {}
+    with transaction.atomic():
+        hr = HRAssessment.objects.update_or_create(
+            interview=interview,
+            defaults=dict(
+                decision=decision,
+                level=level,
+                hold_tenure=hold_tenure,
+                comments=comments,
+                answers=answers,
+                assessor=user,
+            ),
+        )[0]
+        apply_to_person(interview, answers.get("preference"))
+        if interview.result != decision:
+            edit_interview(interview, decision, interview.questions, interview.notes)
+        _follow_up_after_assessment(interview, decision, answers)
+        return hr
 
 
 class OfferError(FollowUpError):
@@ -509,7 +640,7 @@ def accept(offer, joining_date, user):
             status=FollowUp.Status.PENDING,
             defaults=dict(
                 requisition=current.requisition,
-                due=timezone.make_aware(datetime.combine(joining_date, time(9))),
+                due=day_start(joining_date),
                 owner=user,
             ),
         )
@@ -535,14 +666,19 @@ def onboarding(companies):
     )
 
 
-def mark_joined(offer, on):
-    """They turned up. Records the day and closes the joining follow-up."""
+def mark_joined(offer, on, resources="", sim="", notes=""):
+    """They turned up. Records the day, what they were given and whether they got
+    a SIM, and closes the joining follow-up."""
     with transaction.atomic():
         current = Offer.objects.select_for_update().get(pk=offer.pk)
         if current.state != Offer.State.ACCEPTED or current.joined_on:
             raise OfferError("That candidate is not waiting to join.")
         current.joined_on = on
-        current.save(update_fields=["joined_on"])
+        current.resources, current.sim_allotted = resources, sim
+        current.onboarding_notes = notes
+        current.save(
+            update_fields=["joined_on", "resources", "sim_allotted", "onboarding_notes"]
+        )
         FollowUp.objects.filter(
             person=current.person,
             purpose=FollowUp.Purpose.JOINING,
@@ -584,7 +720,7 @@ def funnel(companies):
 
 
 def _at(when):
-    return f"{timezone.localtime(when):%d %b %H:%M}"
+    return f"{timezone.localtime(when):%d %b}"
 
 
 def timeline(person, with_hr=False):
@@ -654,12 +790,20 @@ def timeline(person, with_hr=False):
 
     for c in person.calls.select_related("caller"):
         text = f"Call: {c.get_outcome_display()}"
-        events.append(
-            (c.called_at, c.caller, f"{text}. {c.notes}" if c.notes else text)
-        )
+        if c.notes:
+            text += f". {c.notes}"
+        for name, answers in (
+            ("Mini whereabout", c.mini_whereabout),
+            ("Major whereabout", c.major_whereabout),
+        ):
+            if answers:
+                text += f" {name}: {whereabouts.summary(answers)}."
+        events.append((c.called_at, c.caller, text))
 
     for i in person.interviews.select_related("interviewer"):
         text = f"Interview: {i.get_result_display().lower()}"
+        if i.profile:
+            text += f" ({interview_form.PROFILES.get(i.profile, (i.profile,))[0]})"
         events.append(
             (i.scheduled_at, i.interviewer, f"{text}. {i.notes}" if i.notes else text)
         )
@@ -748,17 +892,13 @@ def schedule_call(person, due, user):
 
 
 def shift_calls(followups, day, reason):
-    """Move pending calls to `day`, each keeping its time of day. For the days
-    staff are out or the queue is too long to get through."""
-    moved = 0
-    with transaction.atomic():
-        for f in followups:
-            if f.purpose != FollowUp.Purpose.CALL:
-                continue
-            at = timezone.localtime(f.due).time()
-            reschedule(f, timezone.make_aware(datetime.combine(day, at)), reason)
-            moved += 1
-    return moved
+    """Move pending calls (not interviews, offers or joinings) to `day`. For the
+    days staff are out or the queue is too long to get through."""
+    return bulk_move(
+        followups.filter(purpose=FollowUp.Purpose.CALL, status=FollowUp.Status.PENDING),
+        day,
+        reason,
+    )
 
 
 RINGING = (FollowUp.Purpose.CALL, FollowUp.Purpose.INTERVIEW)
@@ -822,7 +962,7 @@ def snooze_call(followup, user, length):
         return current
 
 
-def edit_interview(interview, result, questions, notes):
+def edit_interview(interview, result, questions, notes, profile=None, answers=None):
     """Correct a saved interview. If it now reads "selected", the offer opens as
     it would have the first time; a move away from selected leaves the offer
     follow-up for someone to cancel."""
@@ -830,7 +970,13 @@ def edit_interview(interview, result, questions, notes):
         interview.result = result
         interview.questions = questions
         interview.notes = notes
+        if answers is not None:
+            interview.profile = profile or ""
+            interview.answers = answers
         interview.save()
+        if answers is not None:
+            hr = getattr(interview, "hr", None)
+            apply_to_person(interview, hr and hr.answers.get("preference"))
         person = interview.person
         if result == Interview.Result.SELECTED and not person.offers.exists():
             FollowUp.objects.get_or_create(
@@ -839,7 +985,7 @@ def edit_interview(interview, result, questions, notes):
                 status=FollowUp.Status.PENDING,
                 defaults=dict(
                     requisition=interview.requisition,
-                    due=timezone.now(),
+                    due=today(),
                     owner=interview.interviewer,
                 ),
             )

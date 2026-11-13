@@ -80,7 +80,7 @@ def test_schedule_call_view(req, user, client):
     person = source_number(req, "Ravi", "99999 11111", user).person
     FollowUp.objects.filter(person=person).delete()
     client.post(
-        reverse("hiring:schedule_call", args=[person.pk]), {"due": "2031-01-02T10:00"}
+        reverse("hiring:schedule_call", args=[person.pk]), {"due": "2031-01-02"}
     )
     assert person.followups.get().purpose == "call"
 
@@ -100,12 +100,7 @@ def test_edit_interview_opens_the_offer_when_it_becomes_selected(req, user, clie
         person.followups.get(purpose="interview"), "hold", user
     )
     assert not person.followups.filter(purpose="offer").exists()
-    page = client.get(reverse("hiring:interview_edit", args=[interview.pk]))
-    assert page.status_code == 200 and b"Save changes" in page.content
-    client.post(
-        reverse("hiring:interview_edit", args=[interview.pk]),
-        {"result": "selected", "questions": "Q", "notes": "Good"},
-    )
+    edit_interview(interview, "selected", "Q", "Good")
     interview.refresh_from_db()
     assert interview.result == "selected" and interview.notes == "Good"
     assert person.followups.filter(purpose="offer", status="pending").count() == 1
