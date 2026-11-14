@@ -252,6 +252,25 @@ def rename_blocks(user, date, ids, title):
 
 
 @transaction.atomic
+def toggle_goal(user, date, goal_id, done):
+    """Set a goal done or not; the caller says which, so a repeat click is harmless."""
+    plan = plan_for(user, date)
+    if plan is None:
+        raise PlanError("Set your plan for today first.")
+    item = (
+        plan.items.select_for_update()
+        .filter(kind=PlanItem.Kind.GOAL, pk=goal_id)
+        .first()
+    )
+    if not item:
+        raise PlanError("That goal is gone. Refresh and try again.")
+    if item.done != done:
+        item.done = done
+        item.save()
+        plan.save()
+
+
+@transaction.atomic
 def delete_blocks(user, date, ids):
     plan, items = _own_blocks(user, date, ids)
     for item in items:
@@ -370,8 +389,6 @@ def day_panel(user, date):
         ],
         "height": (last - first) * PANEL_HOUR_HEIGHT,
         "now_top": now_top,
-        # Which "floor" (hour of the drawn day) the lift is on, 1 at the first hour.
-        "floor": now.hour - first + 1 if now_top is not None else None,
         "done": done,
         "total": total,
     }

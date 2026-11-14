@@ -1,6 +1,8 @@
+import re
 from pathlib import Path
 
 from django.contrib import messages
+from django.core.exceptions import PermissionDenied
 from django.db.models import Q
 from django.http import FileResponse, Http404
 from django.shortcuts import get_object_or_404, redirect, render
@@ -11,13 +13,16 @@ from core.access import companies_with_access, require_section
 from core.pagination import paginate
 
 from . import interview_form
+from .departments import SUB_DEPARTMENTS
 from .export import interviews_workbook
 from .interview_form import (
     COLUMN_TYPES,
+    PROFILE_OF,
     SECTIONS,
     TABLES,
     AssessmentForm,
     InterviewForm,
+    profile_for,
     read_tables,
     table_shows,
 )
@@ -37,10 +42,28 @@ section = require_section("recruitment", "selecting")
 filed_section = require_section("recruitment", "selecting", "hiring")
 
 
-def _has_hr(request):
-    return (
+def _hr_companies(request):
+    """The active companies where this person holds the HR assessments grant."""
+    return set(
         companies_with_access(request.user, "recruitment", "assessments")
         .filter(pk__in=[c.pk for c in request.companies])
+        .values_list("pk", flat=True)
+    )
+
+
+def _has_hr(request, interview=None):
+    """Whether HR assessments are open to them: for one interview, in its company."""
+    held = _hr_companies(request)
+    return interview.person.company_id in held if interview else bool(held)
+
+
+def _can_edit(request, interview):
+    """Only the interviewer, or someone holding Selecting there, may change an
+    interview; Hiring opens it to read."""
+    return (
+        interview.interviewer_id == request.user.pk
+        or companies_with_access(request.user, "recruitment", "selecting")
+        .filter(pk=interview.person.company_id)
         .exists()
     )
 
@@ -80,7 +103,10 @@ def selecting(request):
 @section
 @require_GET
 def export_interviews(request):
-    return interviews_workbook(_filed(request), include_hr=_has_hr(request))
+    held = _hr_companies(request)
+    return interviews_workbook(
+        _filed(request), include_hr=bool(held), hr_companies=held
+    )
 
 
 def _initial(person):
@@ -94,7 +120,7 @@ def _initial(person):
         "experience_months": person.experience_years
         and round(person.experience_years * 12),
         "expected_salary": person.expected_salary and int(person.expected_salary),
-        "joining_days": "".join(c for c in person.joining_period if c.isdigit()),
+        "joining_days": joining_days(person.joining_period),
         "place_of_birth": person.place_of_birth,
         "date_of_birth": person.date_of_birth and person.date_of_birth.isoformat(),
         "time_of_birth": person.time_of_birth
@@ -103,11 +129,36 @@ def _initial(person):
     }
 
 
+MAX_UPLOAD = 10 * 1024 * 1024
+
+
+def joining_days(period):
+    """Days from the card's free-text joining period: "15 days", "2 weeks", "1 month",
+    or a range like "15-20 days" (its first number)."""
+    found = re.search(r"(\d+)\s*(week|month)?", period or "", re.I)
+    if not found:
+        return ""
+    unit = {"week": 7, "month": 30}.get((found[2] or "").lower(), 1)
+    return int(found[1]) * unit
+
+
 def _files(request, interview):
     """Keep an uploaded photo or resume; a file not sent leaves the old one."""
     for name in ("photo", "resume"):
-        if request.FILES.get(name):
-            setattr(interview, name, request.FILES[name])
+        file = request.FILES.get(name)
+        if not file:
+            continue
+        if file.size > MAX_UPLOAD or (
+            name == "photo" and not file.content_type.startswith("image/")
+        ):
+            kind = "an image" if name == "photo" else "a file"
+            messages.error(request, f"The {name} wasn't kept: send {kind} under 10 MB.")
+            continue
+        if getattr(interview, name):
+            getattr(interview, name).delete(
+                save=False
+            )  # don't leave the old one behind
+        setattr(interview, name, file)
     interview.save(update_fields=["photo", "resume"])
 
 
@@ -124,10 +175,12 @@ def interview_file(request, pk, name):
 
 def _tables(request, interview=None, saved=False):
     """Every table's rows: as posted, else as saved. Posted rows of a table the
-    chosen profile doesn't show are dropped."""
+    chosen department and sub-department don't show are dropped."""
     if request.method == "POST" and not saved:
-        profile = request.POST.get("profile", "")
-        got = read_tables(request.POST, profile)
+        post = request.POST
+        got = read_tables(
+            post, profile_for(post.get("department"), post.get("sub_department"))
+        )
         return {**{k: [] for k in TABLES}, **got}
     saved = interview.answers if interview else {}
     return {k: saved.get(k, []) for k in TABLES}
@@ -153,6 +206,8 @@ def _page(request, form, person, when, tables, **extra):
             "max_rows": interview_form.MAX_ROWS,
             "sections": _sections(form),
             "today": timezone.localdate().isoformat(),
+            "sub_departments": SUB_DEPARTMENTS,
+            "profile_of": {f"{d}|{s}": p for (d, s), p in PROFILE_OF.items()},
             "table_defs": [
                 {
                     "key": k,
@@ -183,8 +238,16 @@ def record(request, pk):
         interviews_waiting(request.user, request.companies), pk=pk
     )
     person = followup.person
+    req = followup.requisition
     form = InterviewForm(
-        request.POST or None, initial=_initial(person), user=request.user
+        request.POST or None,
+        initial={
+            **_initial(person),
+            # From the requisition; the interviewer can change both.
+            "department": req and req.department,
+            "sub_department": req and req.sub_department,
+        },
+        user=request.user,
     )
     tables = _tables(request)
     if request.method == "POST" and form.is_valid():
@@ -193,7 +256,7 @@ def record(request, pk):
                 followup,
                 Interview.Result.PENDING,
                 request.user,
-                profile=form.cleaned_data["profile"],
+                profile=form.profile,
                 answers={**form.answers(), **tables},
             )
         except FollowUpError as exc:
@@ -209,16 +272,23 @@ def record(request, pk):
 def review(request, pk):
     """Open a filed interview: edit it, and (for those allowed) fill the HR form."""
     interview = get_object_or_404(_filed(request), pk=pk)
-    has_hr = _has_hr(request)
+    has_hr = _has_hr(request, interview)
     existing = getattr(interview, "hr", None)
     posted = request.method == "POST"
-    hr = bool(posted and has_hr and request.POST.get("which") == "hr")
+    hr = bool(posted and request.POST.get("which") == "hr")
+    if hr and not has_hr:
+        raise PermissionDenied
+    if posted and not hr and not _can_edit(request, interview):
+        raise PermissionDenied
     form = InterviewForm(
         request.POST if posted and not hr else None,
         initial={
+            "department": interview.requisition and interview.requisition.department,
+            "sub_department": interview.requisition
+            and interview.requisition.sub_department,
             **interview.answers,
-            "profile": interview.profile,
-            "assessor": interview.answers.get("assessor_id"),
+            "assessor": interview.answers.get("assessor_id")
+            or interview.interviewer_id,
         },
         user=request.user,
     )
@@ -257,7 +327,7 @@ def review(request, pk):
             interview.result,
             interview.questions,
             interview.notes,
-            profile=form.cleaned_data["profile"],
+            profile=form.profile,
             answers={**form.answers(), **tables},
         )
         _files(request, interview)
